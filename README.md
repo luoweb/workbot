@@ -29,6 +29,7 @@ This plugin provides two tools:
 
 - “Mini_Claw”: a soulful AI assistant for conversation and task execution. It has short-term and long-term memory, identity/personality/soul, and adapts to user input for personalized service.
 - “Skill Management”: manages the skills directory. You can view/add/delete skills, and run dependency detection/installation.
+
   ![alt text](_assets/image_0.png)
 
 ### How to Use (in Dify)
@@ -36,16 +37,20 @@ This plugin provides two tools:
 1. Install this plugin from the marketplace.
 2. For self-hosted users: set `Files_url` in Dify’s `.env` to your Dify address (restart Dify afterward), otherwise Dify may not be able to fetch uploaded files.
 3. Build a workflow like the example below:
+
    ![alt text](_assets/image_1.png)
+
 4. Chat with Mini_Claw and set up a persona:
-   ![alt text](_assets/image-2.png)
+
+   ![alt text](_assets/image_2.png)
 
 Tips:
 - Tip 1: use the `update_persona` tool to adjust identity and soul (`SOUL.md`) to make your Mini_Claw feel more “alive”.
 - Tip 2: send the command “重置角色” (reset role) to reset Mini_Claw’s identity, clear memory, and start over.
 
 5. Use Skill Management to extend Mini_Claw with custom tools (add/delete/list skills, availability checks, dependency checks/installation):
-   ![alt text](_assets/image-3.png)
+
+   ![alt text](_assets/image_3.png)
 
 Feature 1: Built-in dependency detection and installation. The Agent is no longer allowed to install dependencies by itself. Please make sure dependencies are installed before use.
 
