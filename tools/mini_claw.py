@@ -47,6 +47,7 @@ from utils.mini_claw_storage import (
 )
 from utils.mini_claw_uploads import _build_uploads_context
 from utils.mini_claw_prompt import build_system_prompt_content
+from utils.mini_claw_hooks import DailyWriteContext, MemoryWriteContext, filter_memory_write, should_write_daily
 
 from dify_plugin import Tool
 from dify_plugin.entities.model.message import (
@@ -966,7 +967,9 @@ class SkillAgentTool(Tool):
                 return
 
             try:
-                _memory_flush_for_compaction(text=prefix_text)
+                filtered = filter_memory_write(MemoryWriteContext(user_id=user_id, text=prefix_text))
+                if filtered.strip():
+                    _memory_flush_for_compaction(text=filtered)
             except Exception:
                 pass
 
@@ -2254,28 +2257,15 @@ class SkillAgentTool(Tool):
                 yield from stream_text_to_user("未生成任何文本或文件输出。")
 
             try:
-                def _is_approval_related_text(text: str) -> bool:
-                    s = str(text or "")
-                    if not s:
-                        return False
-                    keys = [
-                        "需要你确认后才能继续",
-                        "需要你确认后才能继续执行",
-                        "该步骤需要执行一个未在允许列表的命令",
-                        "执行审批",
-                        "审批结果",
-                        "用户已审批",
-                        "已收到你的拒绝",
-                        "允许一次",
-                        "总是允许",
-                        "拒绝",
-                    ]
-                    return any(k in s for k in keys)
-
-                s_user = str(user_input or "").strip()
-                is_short_numeric = bool(re.fullmatch(r"\d{1,3}", s_user or ""))
-                in_approval_flow = bool(approval_pending) or bool(approval_context) or _is_approval_related_text(assistant_text_for_history)
-                if not (in_approval_flow and is_short_numeric) and not _is_approval_related_text(assistant_text_for_history):
+                if should_write_daily(
+                    DailyWriteContext(
+                        user_id=user_id,
+                        user_text=str(user_input or ""),
+                        assistant_text=str(assistant_text_for_history or ""),
+                        approval_pending=bool(approval_pending),
+                        approval_context=str(approval_context or ""),
+                    )
+                ):
                     _append_daily_dialogue(
                         storage=storage,
                         session=self.session,

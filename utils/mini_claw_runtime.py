@@ -18,6 +18,7 @@ from utils.mini_claw_exec import (
     _skill_contains_python_module,
 )
 from utils.mini_claw_exec_policy import resolve_and_validate_exec
+from utils.mini_claw_hooks import ExecPolicyContext, apply_exec_policies
 from utils.mini_claw_constants import EXEC_ALLOWED_BINS
 from utils.mini_claw_paths import (
     _normalize_relative_file_path,
@@ -877,6 +878,18 @@ class _AgentRuntime:
         if not resolved:
             return {"error": err or "skill not found", "skill": skill_name}
         skill_path = _safe_join(self.skills_root, resolved)
+        policy_out = apply_exec_policies(
+            ExecPolicyContext(
+                tool="run_skill_command",
+                skill_name=str(resolved or ""),
+                command=[str(x) for x in (command or [])],
+                session_dir=str(self.session_dir or ""),
+                skills_root=str(self.skills_root) if self.skills_root else None,
+            )
+        )
+        if not policy_out.get("ok"):
+            return policy_out
+        command = policy_out.get("command") if isinstance(policy_out.get("command"), list) else command
         exe = command[0]
         if exe == "python":
             if "-m" in command:
@@ -1085,6 +1098,18 @@ class _AgentRuntime:
     ) -> dict[str, Any]:
         if not command:
             return {"error": "command must be a non-empty list"}
+        policy_out = apply_exec_policies(
+            ExecPolicyContext(
+                tool="run_temp_command",
+                skill_name=None,
+                command=[str(x) for x in (command or [])],
+                session_dir=str(self.session_dir or ""),
+                skills_root=str(self.skills_root) if self.skills_root else None,
+            )
+        )
+        if not policy_out.get("ok"):
+            return policy_out
+        command = policy_out.get("command") if isinstance(policy_out.get("command"), list) else command
         exe = command[0]
         if exe == "python":
             if "-m" in command:

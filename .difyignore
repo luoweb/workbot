@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Local env & runtime artifacts
+.env
+temp/
+
 # Distribution / packaging
 .Python
 build/
@@ -184,4 +188,3 @@ Thumbs.db
 *.difypkg
 temp/
 skills/
-

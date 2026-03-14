@@ -7,6 +7,7 @@ from typing import Any
 
 from utils.mini_claw_memory import _dt_beijing
 from utils.mini_claw_storage import _get_memory_storage_key, _storage_get_text
+from utils.mini_claw_hooks import PromptBuildContext, build_prompt_layers
 
 
 def _xml_escape(text: Any) -> str:
@@ -181,31 +182,24 @@ def build_system_prompt_content(
         system_lines.append(approval_context)
 
     soul_md = _storage_get_text(storage, soul_key).strip()
-    user_md = _storage_get_text(storage, user_key).strip()
-    identity_md = _storage_get_text(storage, identity_key).strip()
-    memory_md = _storage_get_text(storage, memory_key).strip()
-    dt_now_bj = _dt_beijing()
-    today = dt_now_bj.strftime("%Y-%m-%d")
-    yesterday = (dt_now_bj - timedelta(days=1)).strftime("%Y-%m-%d")
-    uid = str(user_id or "").strip() or "global_user"
-    daily_today_key = _get_memory_storage_key(session, f"memory/{uid}/{today}.md")
-    daily_yesterday_key = _get_memory_storage_key(session, f"memory/{uid}/{yesterday}.md")
-    daily_today_md = _storage_get_text(storage, daily_today_key).strip()
-    daily_yesterday_md = _storage_get_text(storage, daily_yesterday_key).strip()
-
+    layers = build_prompt_layers(
+        PromptBuildContext(
+            storage=storage,
+            session=session,
+            user_id=str(user_id or "").strip() or "global_user",
+            identity_key=identity_key,
+            user_key=user_key,
+            soul_key=soul_key,
+            memory_key=memory_key,
+        )
+    )
+    shared_blocks = layers.get("shared") if isinstance(layers.get("shared"), list) else []
+    personal_blocks = layers.get("personal") if isinstance(layers.get("personal"), list) else []
+    session_blocks = layers.get("session") if isinstance(layers.get("session"), list) else []
     context_blocks: list[tuple[str, str]] = []
-    if soul_md:
-        context_blocks.append(("SOUL.md", soul_md))
-    if identity_md:
-        context_blocks.append(("IDENTITY.md", identity_md))
-    if user_md:
-        context_blocks.append(("USER.md", user_md))
-    if memory_md:
-        context_blocks.append(("MEMORY.md", memory_md))
-    if daily_yesterday_md:
-        context_blocks.append((f"memory/{uid}/{yesterday}.md", daily_yesterday_md))
-    if daily_today_md:
-        context_blocks.append((f"memory/{uid}/{today}.md", daily_today_md))
+    context_blocks.extend([(str(p), str(c)) for p, c in shared_blocks if str(c or "").strip()])
+    context_blocks.extend([(str(p), str(c)) for p, c in personal_blocks if str(c or "").strip()])
+    context_blocks.extend([(str(p), str(c)) for p, c in session_blocks if str(c or "").strip()])
 
     if context_blocks:
         insert_at = len(system_lines)
