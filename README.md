@@ -1,7 +1,7 @@
 ## Mini Claw
 
 **Author:** lfenghx  
-**Version:** 1.0.0  
+**Version:** 1.1.0
 **Type:** Tool (Tool Plugin)
 
 ### Overview

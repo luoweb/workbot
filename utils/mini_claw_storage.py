@@ -46,6 +46,39 @@ def _get_conversation_storage_id(session: Any) -> str:
     return sid or "global_conversation"
 
 
+def _sanitize_storage_id(value: str, *, fallback: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return fallback
+    s = s.replace(":", "_").replace("/", "_").replace("\\", "_").replace("\n", "_").replace("\r", "_").replace("\t", "_")
+    s = s.strip("_")
+    if not s:
+        return fallback
+    if len(s) > 80:
+        s = s[:80]
+    return s
+
+
+def _get_user_persona_storage_key(session: Any, user_id: str, name: str) -> str:
+    suffix = str(name or "").strip() or "default"
+    uid = _sanitize_storage_id(user_id, fallback="global_user")
+    return PERSONA_KEY_PREFIX + _get_app_storage_id(session) + ":user:" + uid + ":" + suffix
+
+
+def _get_user_persona_storage_key_for(session: Any, user_id: str, name: str) -> str:
+    return _get_user_persona_storage_key(session, user_id, name)
+
+
+def _get_user_memory_storage_key(session: Any, user_id: str, name: str) -> str:
+    suffix = str(name or "").strip() or "default"
+    uid = _sanitize_storage_id(user_id, fallback="global_user")
+    return MEMORY_KEY_PREFIX + _get_app_storage_id(session) + ":user:" + uid + ":" + suffix
+
+
+def _get_user_memory_storage_key_for(session: Any, user_id: str, name: str) -> str:
+    return _get_user_memory_storage_key(session, user_id, name)
+
+
 def _get_history_storage_key(session: Any) -> str:
     return HISTORY_KEY_PREFIX + _get_conversation_storage_id(session)
 

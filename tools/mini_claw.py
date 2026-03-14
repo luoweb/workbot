@@ -37,6 +37,8 @@ from utils.mini_claw_storage import (
     _get_history_storage_key,
     _get_memory_storage_key,
     _get_persona_storage_key,
+    _get_user_memory_storage_key_for,
+    _get_user_persona_storage_key_for,
     _get_session_dir_storage_key,
     _storage_get_json,
     _storage_get_text,
@@ -44,6 +46,7 @@ from utils.mini_claw_storage import (
     _storage_set_text,
 )
 from utils.mini_claw_uploads import _build_uploads_context
+from utils.mini_claw_prompt import build_system_prompt_content
 
 from dify_plugin import Tool
 from dify_plugin.entities.model.message import (
@@ -54,6 +57,8 @@ from dify_plugin.entities.model.message import (
     UserPromptMessage,
 )
 from dify_plugin.entities.tool import ToolInvokeMessage
+from utils.mini_claw_memory import _append_daily_dialogue, _dt_beijing, _reset_role
+
 
 class SkillAgentTool(Tool):
     def _invoke(self, tool_parameters: dict[str, Any]) -> Generator[ToolInvokeMessage]:
@@ -62,6 +67,11 @@ class SkillAgentTool(Tool):
         timeout_seconds = int(tool_parameters.get("timeout_seconds") or 120)
         compaction_max_prompt_tokens = int(tool_parameters.get("compaction_max_prompt_tokens") or 12000)
         loop_detection = bool(tool_parameters.get("loop_detection") if tool_parameters.get("loop_detection") is not None else True)
+        exec_approval_enabled = bool(
+            tool_parameters.get("exec_approval_enabled")
+            if tool_parameters.get("exec_approval_enabled") is not None
+            else True
+        )
 
         memory_turns = int(tool_parameters.get("memory_turns") or 12)
         system_prompt = tool_parameters.get("system_prompt") or "你是一个xxxx"
@@ -80,18 +90,13 @@ class SkillAgentTool(Tool):
             if not s:
                 return None
             s2 = s.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
-            if any(x in s2 for x in ["拒绝", "不允许", "deny", "no"]):
-                return "deny"
-            if any(x in s2 for x in ["总是允许", "永远允许", "一直允许", "alwaysallow", "always"]):
+            s2 = s2.translate(str.maketrans({"１": "1", "２": "2", "３": "3"}))
+            if s2 == "1":
+                return "once"
+            if s2 == "2":
                 return "always"
-            if any(x in s2 for x in ["允许本技能", "本技能允许"]):
-                return "skill"
-            if any(x in s2 for x in ["允许本会话", "本会话允许", "会话内允许", "session"]):
-                return "session"
-            if any(x in s2 for x in ["允许一次", "允许本次", "once"]):
-                return "once"
-            if _is_allow_reply(s):
-                return "once"
+            if s2 == "3":
+                return "deny"
             return None
 
         def _coerce_allow_entries(v: Any) -> list[dict[str, Any]]:
@@ -142,10 +147,7 @@ class SkillAgentTool(Tool):
                 return store
             now_ts = int(time.time())
             root = _ensure_path(store, ["exec"])
-            if scope == "skill" and skill_name:
-                bucket = _ensure_path(root, ["allow_skill", str(skill_name)])
-            else:
-                bucket = _ensure_path(root, ["allow"])
+            bucket = _ensure_path(root, ["allow"])
             items = bucket.get(exe0)
             entries = _coerce_allow_entries(items)
             existing = next((e for e in entries if str(e.get("pattern") or "").strip() == pat0), None)
@@ -167,44 +169,43 @@ class SkillAgentTool(Tool):
         ) -> dict[str, Any] | None:
             if not exe0:
                 return None
-            patterns: list[str] = []
-            for src, scope in [(session_grants, "session"), (grants, "app")]:
-                if not isinstance(src, dict):
-                    continue
-                exec_cfg = src.get("exec") if isinstance(src.get("exec"), dict) else {}
-                allow = exec_cfg.get("allow")
-                patterns.extend(_extract_patterns(allow.get(exe0) if isinstance(allow, dict) else None))
-                if tool_name == "run_skill_command" and skill_name:
-                    allow_skill = exec_cfg.get("allow_skill")
-                    if isinstance(allow_skill, dict) and isinstance(allow_skill.get(str(skill_name)), dict):
-                        patterns.extend(_extract_patterns(allow_skill.get(str(skill_name), {}).get(exe0)))
-            dedup: list[str] = []
-            for p in patterns:
-                if p and p not in dedup:
-                    dedup.append(p)
-            if not dedup:
+            has_entry = False
+            exec_cfg = grants.get("exec") if isinstance(grants.get("exec"), dict) else {}
+            allow = exec_cfg.get("allow")
+            if isinstance(allow, dict) and _coerce_allow_entries(allow.get(exe0)):
+                has_entry = True
+            if not has_entry:
                 return None
             return {
                 "exe": exe0,
                 "allow_not_in_allowlist": True,
-                "allow_untrusted_path": True,
-                "path_allowlist": dedup,
             }
 
         def invoke_llm_text_simple(prompt_messages: list[Any]) -> str:
             try:
                 try:
-                    resp = self.session.model.llm.invoke(
-                        model_config=model,
-                        prompt_messages=prompt_messages,
-                        stream=False,
-                    )
+                    try:
+                        resp = self.session.model.llm.invoke(
+                            model_config=model,
+                            prompt_messages=prompt_messages,
+                            stream=False,
+                        )
+                    except Exception as e:
+                        msg = str(e)
+                        if ("incremental_output" in msg) and ("True" in msg):
+                            resp = self.session.model.llm.invoke(
+                                model_config=model,
+                                prompt_messages=prompt_messages,
+                            )
+                        else:
+                            raise
                 except TypeError:
                     resp = self.session.model.llm.invoke(
                         model_config=model,
                         prompt_messages=prompt_messages,
                     )
-            except Exception:
+            except Exception as e:
+                _dbg(f"onboarding_extract_invoke_failed err={_shorten_text(str(e), 500)}")
                 return ""
 
             if _safe_get(resp, "message") is not None:
@@ -234,10 +235,8 @@ class SkillAgentTool(Tool):
         session_dir_key = _get_session_dir_storage_key(self.session)
         approval_pending_key = _get_conversation_approval_storage_key(self.session, "pending")
         approval_grants_key = _get_approval_storage_key(self.session, "grants")
-        approval_session_grants_key = _get_conversation_approval_storage_key(self.session, "exec_grants")
         approval_state = _storage_get_json(storage, approval_pending_key)
         grants = _storage_get_json(storage, approval_grants_key)
-        session_grants = _storage_get_json(storage, approval_session_grants_key)
         approval_kind = str(approval_state.get("kind") or "").strip()
         approval_pending = bool(approval_state.get("pending"))
         approval_just_granted = False
@@ -276,121 +275,176 @@ class SkillAgentTool(Tool):
                     yield self.create_text_message(prompt)
                     return
             else:
-                decision = _parse_exec_approval_reply(user_input)
-                if decision == "deny":
+                if not exec_approval_enabled:
+                    original_query = str(approval_state.get("original_query") or "").strip()
                     _storage_set_json(storage, approval_pending_key, None)
-                    yield self.create_text_message("🤝已收到你的拒绝，本次不会执行需要审批的操作。\n")
-                    return
-                if decision in {"once", "session", "skill", "always"}:
-                    next_grants = dict(grants)
-                    next_session_grants = dict(session_grants)
-                    exe0 = str(approval_state.get("exe") or "").strip()
-                    skill0 = str(approval_state.get("skill_name") or "").strip() or None
-                    resolved_path = str(approval_state.get("resolved_exe") or approval_state.get("path") or "").strip()
-                    cmd = approval_state.get("command") if isinstance(approval_state.get("command"), list) else []
+                    if original_query:
+                        effective_query = original_query + "\n\n[用户已审批]\n已关闭执行审批，自动放行上一轮命令。"
+                    exec_once_allowed = approval_state if isinstance(approval_state, dict) else None
+                    approval_context = "\n\n[审批结果]\n已关闭执行审批：自动放行上一轮命令。\n"
+                else:
+                    decision = _parse_exec_approval_reply(user_input)
+                    if decision == "deny":
+                        _storage_set_json(storage, approval_pending_key, None)
+                        yield self.create_text_message("🤝已收到你的拒绝，本次不会执行需要审批的操作。\n")
+                        return
+                    if decision in {"once", "always"}:
+                        next_grants = dict(grants)
+                        exe0 = str(approval_state.get("exe") or "").strip()
+                        resolved_path = str(approval_state.get("resolved_exe") or approval_state.get("path") or "").strip()
+                        cmd = approval_state.get("command") if isinstance(approval_state.get("command"), list) else []
 
-                    if decision == "always":
-                        _add_allow_entry(
-                            store=next_grants,
-                            scope="always",
-                            exe=exe0,
-                            pattern=resolved_path,
-                            skill_name=None,
-                            command=cmd,
-                        )
-                        _storage_set_json(storage, approval_grants_key, next_grants)
-                    elif decision == "skill":
-                        if skill0:
+                        if decision == "always":
                             _add_allow_entry(
                                 store=next_grants,
-                                scope="skill",
+                                scope="always",
                                 exe=exe0,
-                                pattern=resolved_path,
-                                skill_name=skill0,
-                                command=cmd,
-                            )
-                            _storage_set_json(storage, approval_grants_key, next_grants)
-                        else:
-                            decision = "session"
-                            _add_allow_entry(
-                                store=next_session_grants,
-                                scope="session",
-                                exe=exe0,
-                                pattern=resolved_path,
+                                pattern="*",
                                 skill_name=None,
                                 command=cmd,
                             )
-                            _storage_set_json(storage, approval_session_grants_key, next_session_grants)
-                    elif decision == "session":
-                        _add_allow_entry(
-                            store=next_session_grants,
-                            scope="session",
-                            exe=exe0,
-                            pattern=resolved_path,
-                            skill_name=None,
-                            command=cmd,
+                            _storage_set_json(storage, approval_grants_key, next_grants)
+
+                        _storage_set_json(storage, approval_pending_key, None)
+                        approval_just_granted = True
+                        original_query = str(approval_state.get("original_query") or "").strip()
+                        if original_query:
+                            effective_query = original_query + "\n\n[用户已审批]\n允许执行需要审批的操作。"
+                        exec_once_allowed = approval_state if isinstance(approval_state, dict) else None
+
+                        decision_label = {
+                            "once": "允许一次",
+                            "always": "总是允许",
+                        }.get(decision, "允许")
+                        approval_context = (
+                            "\n\n[审批结果]\n"
+                            + f"用户选择：{decision_label}。\n"
+                            + "请继续推进原任务并重试上一轮被拦截的命令。\n"
+                            + "命令："
+                            + json.dumps(cmd or [], ensure_ascii=False)
+                            + ("\n可执行文件：" + resolved_path if resolved_path else "")
+                            + "\n"
                         )
-                        _storage_set_json(storage, approval_session_grants_key, next_session_grants)
-
-                    _storage_set_json(storage, approval_pending_key, None)
-                    approval_just_granted = True
-                    original_query = str(approval_state.get("original_query") or "").strip()
-                    if original_query:
-                        effective_query = original_query + "\n\n[用户已审批]\n允许执行需要审批的操作。"
-                    exec_once_allowed = approval_state if isinstance(approval_state, dict) else None
-
-                    decision_label = {
-                        "once": "允许一次",
-                        "session": "允许本会话",
-                        "skill": "允许本技能",
-                        "always": "总是允许",
-                    }.get(decision, "允许")
-                    approval_context = (
-                        "\n\n[审批结果]\n"
-                        + f"用户选择：{decision_label}。\n"
-                        + "请继续推进原任务并重试上一轮被拦截的命令。\n"
-                        + "命令："
-                        + json.dumps(cmd or [], ensure_ascii=False)
-                        + ("\n可执行文件：" + resolved_path if resolved_path else "")
-                        + "\n"
-                    )
-                else:
-                    prompt = (
-                        "需要你确认后才能继续执行相关命令。请回复以下任意一种：\n"
-                        "- “允许一次”\n"
-                        "- “允许本会话”\n"
-                        "- “允许本技能”\n"
-                        "- “总是允许”\n"
-                        "- “拒绝”\n"
-                    )
-                    yield self.create_text_message(prompt)
-                    return
+                    else:
+                        prompt = (
+                            "需要你确认后才能继续执行相关命令。请回复序号：\n"
+                            "1) 允许一次（仅本次）\n"
+                            "2) 总是允许（后续不再提示）\n"
+                            "3) 拒绝\n"
+                        )
+                        yield self.create_text_message(prompt)
+                        return
 
         onboarding_key = _get_persona_storage_key(self.session, "onboarding")
         identity_key = _get_persona_storage_key(self.session, "IDENTITY.md")
-        user_key = _get_persona_storage_key(self.session, "USER.md")
+        user_id = str(getattr(self.runtime, "user_id", None) or "").strip() or "global_user"
+        users_index_key = _get_persona_storage_key(self.session, "users_index")
+        user_key = _get_user_persona_storage_key_for(self.session, user_id, "USER.md")
+        user_onboarding_key = _get_user_persona_storage_key_for(self.session, user_id, "user_onboarding")
         soul_key = _get_persona_storage_key(self.session, "SOUL.md")
-        memory_key = _get_memory_storage_key(self.session, "MEMORY.md")
+        memory_key = _get_user_memory_storage_key_for(self.session, user_id, "MEMORY.md")
         identity_md = _storage_get_text(storage, identity_key).strip()
         onboarding_state = _storage_get_json(storage, onboarding_key)
         onboarding_completed = bool(onboarding_state.get("completed")) and bool(identity_md)
+        user_md = _storage_get_text(storage, user_key).strip()
 
         reset_words = ["重置身份", "重置设定", "重置角色", "重新初始化", "重新认识", "重做初始化", "换个设定", "改角色", "改设定"]
         if any(w in str(user_input or "") for w in reset_words):
-            _storage_set_json(storage, onboarding_key, {"stage": 0, "completed": False, "reset_at": int(time.time())})
-            _storage_set_text(storage, identity_key, "")
-            _storage_set_text(storage, soul_key, "")
-            _storage_set_text(storage, user_key, "")
-            _storage_set_text(storage, memory_key, "")
-            try:
-                now_ts = time.time()
-                for days_ago in range(0, 30):
-                    day = time.strftime("%Y-%m-%d", time.localtime(now_ts - (days_ago * 86400)))
-                    daily_key = _get_memory_storage_key(self.session, f"memory/{day}.md")
-                    _storage_set_text(storage, daily_key, "")
-            except Exception:
-                pass
+            _reset_role(
+                storage=storage,
+                session=self.session,
+                onboarding_key=onboarding_key,
+                identity_key=identity_key,
+                user_key=user_key,
+                soul_key=soul_key,
+                memory_key=memory_key,
+                users_index_key=users_index_key,
+                keep_daily_days=30,
+            )
             yield self.create_text_message("🦞角色重置成功：已清除身份设定与记忆信息，你可通过发送消息再次建立你的专属AI助手。\n")
+            return
+
+        if onboarding_completed and not user_md:
+            user_onboarding_state = _storage_get_json(storage, user_onboarding_key)
+            if not bool(user_onboarding_state.get("pending")):
+                _storage_set_json(
+                    storage,
+                    user_onboarding_key,
+                    {"pending": True, "stage": 1, "created_at": int(time.time())},
+                )
+
+                def _pick_identity_field(md: str, field: str) -> str:
+                    m = re.search(rf"-\s*\*\*{re.escape(field)}:\*\*\s*(.+)", md or "")
+                    return str(m.group(1) or "").strip() if m else ""
+
+                agent_name = _pick_identity_field(identity_md, "Name") or "小元"
+                agent_creature = _pick_identity_field(identity_md, "Creature") or "AI 助手"
+                agent_vibe = _pick_identity_field(identity_md, "Vibe") or "温柔、幽默、靠谱"
+                agent_emoji = _pick_identity_field(identity_md, "Emoji") or "🤖"
+                yield self.create_text_message(
+                    f"你好哇，新朋友！我是 {agent_name}{agent_emoji}，一个{agent_creature}，风格是「{agent_vibe}」。\n"
+                    "请问我该怎么称呼你呢？\n"
+                    "（请只回复你的称呼，例如：老板 / 张总 / 小王 / Lily）\n"
+                )
+                return
+
+            extractor_system = SystemPromptMessage(
+                content=(
+                    "你是信息提取器。请从用户回答中提取用户信息，输出严格 JSON。\n"
+                    "输出必须是 JSON 对象本体：不要 Markdown、不要代码块、不要解释、不要多余字符。\n"
+                    "必须包含所有字段；缺失时用空字符串。\n"
+                    "\n"
+                    'JSON schema: {"user":{"name": string, "addressing": string}}\n'
+                    "\n"
+                    "字段映射规则：\n"
+                    "- user.name：用户的姓名/名字（例如“我叫张三/我是张三”）。\n"
+                    "- user.addressing：用户希望你怎么称呼TA（例如“叫我老板/以后叫我老板/称呼我老板”）。\n"
+                    "- 如果用户只回复一个词（例如“老王/Lily/老板”），优先把它当作 user.addressing。\n"
+                    "\n"
+                    '示例：输入："叫我老板" 输出：{"user":{"name":"","addressing":"老板"}}\n'
+                    '示例：输入："我叫张三" 输出：{"user":{"name":"张三","addressing":""}}\n'
+                    '示例：输入："老王" 输出：{"user":{"name":"","addressing":"老王"}}\n'
+                )
+            )
+            extracted = invoke_llm_text_simple([extractor_system, UserPromptMessage(content=user_input)])
+            json_text = ""
+            if extracted:
+                a = extracted.find("{")
+                b = extracted.rfind("}")
+                if a != -1 and b != -1 and b > a:
+                    json_text = extracted[a : b + 1]
+            parsed: dict[str, Any] = {}
+            if json_text:
+                try:
+                    obj = json.loads(json_text)
+                    parsed = obj if isinstance(obj, dict) else {}
+                except Exception:
+                    parsed = {}
+            user_obj = parsed.get("user") if isinstance(parsed.get("user"), dict) else {}
+            user_name = str(user_obj.get("name") or "").strip()
+            user_addressing = str(user_obj.get("addressing") or "").strip()
+            if not user_addressing:
+                s_in = str(user_input or "").strip()
+                if s_in and re.fullmatch(r"[^\s，。；;!\n]{1,20}", s_in):
+                    user_addressing = s_in
+            if not user_addressing and not user_name:
+                yield self.create_text_message("我还没听清楚～请只回复你希望我怎么称呼你（例如：老板 / 张总 / 小王 / Lily）。\n")
+                return
+
+            user_md_next = (
+                "# USER.md - Who Are You?\n\n"
+                f"- **Name:** {user_name}\n"
+                f"- **Addressing:** {user_addressing}\n"
+            )
+            _storage_set_text(storage, user_key, user_md_next)
+            idx = _storage_get_json(storage, users_index_key)
+            users = idx.get("users") if isinstance(idx.get("users"), list) else []
+            users2: list[str] = [str(x) for x in users if isinstance(x, str) and str(x).strip()]
+            if user_id not in users2:
+                users2.append(user_id)
+            _storage_set_json(storage, users_index_key, {"users": users2})
+            _storage_set_json(storage, user_onboarding_key, None)
+            yield self.create_text_message(f"✅好的，我会称呼你为「{user_addressing}」。\n")
             return
 
         if not onboarding_completed:
@@ -419,66 +473,6 @@ class SkillAgentTool(Tool):
                 )
                 return
 
-            def _guess_first_emoji(text: str) -> str:
-                s = str(text or "")
-                if not s:
-                    return ""
-                m = re.search(
-                    r"(?:签名|emoji|表情|标签|tag)\s*(?:是|为|=|:|：)?\s*([^\s])",
-                    s,
-                    flags=re.I,
-                )
-                if m:
-                    return str(m.group(1) or "").strip()
-                for ch in s:
-                    if ord(ch) >= 0x1F300:
-                        return ch
-                return ""
-
-            def _heuristic_extract(text: str) -> dict[str, dict[str, str]]:
-                s = str(text or "")
-                user_name = ""
-                user_addressing = ""
-                agent_name = ""
-                agent_creature = ""
-                agent_vibe = ""
-                agent_emoji = _guess_first_emoji(s)
-
-                m_user_addressing = re.search(r"(?:以后叫我|你可以叫我|请叫我|称呼我|叫我)\s*([^\s，。；;!\n]{1,20})", s)
-                if m_user_addressing:
-                    user_addressing = str(m_user_addressing.group(1) or "").strip()
-
-                m_user_name = re.search(r"(?:我叫|我是)\s*([^\s，。；;!\n]{1,20})", s)
-                if m_user_name:
-                    user_name = str(m_user_name.group(1) or "").strip()
-
-                m_agent = re.search(r"(?:你是|你叫)\s*([^\s，。；;!\n]{1,20})", s)
-                if m_agent:
-                    agent_name = str(m_agent.group(1) or "").strip()
-
-                if "小动物" in s:
-                    agent_creature = "小动物"
-                elif "程序精灵" in s:
-                    agent_creature = "程序精灵"
-                elif "赛博管家" in s:
-                    agent_creature = "赛博管家"
-                elif "小孩" in s or "孩子" in s:
-                    agent_creature = "小孩"
-                elif "AI" in s and ("助手" in s or "助理" in s):
-                    agent_creature = "AI 助手"
-
-                vibe_hits: list[str] = []
-                for w in ["温柔", "幽默", "小调皮", "克制", "直接", "严谨", "专业", "靠谱", "可爱", "天真", "天真无邪", "好奇", "童真"]:
-                    if w in s:
-                        vibe_hits.append(w)
-                if vibe_hits:
-                    agent_vibe = "、".join(dict.fromkeys(vibe_hits))
-
-                return {
-                    "user": {"name": user_name, "addressing": user_addressing},
-                    "agent": {"name": agent_name, "creature": agent_creature, "vibe": agent_vibe, "emoji": agent_emoji},
-                }
-
             extractor_system = SystemPromptMessage(
                 content=(
                     "你是信息提取器。请从用户回答中提取身份与偏好，输出严格 JSON。\n"
@@ -504,26 +498,40 @@ class SkillAgentTool(Tool):
                     '输出：{"user":{"name":"","addressing":"哥哥"},"agent":{"name":"小元","creature":"小孩","vibe":"像孩子一样天真无邪、对一切充满好奇","emoji":"❓"}}\n'
                     '输入："叫我老板；你叫小元；你是赛博管家；语气严谨克制；emoji=🤖"\n'
                     '输出：{"user":{"name":"","addressing":"老板"},"agent":{"name":"小元","creature":"赛博管家","vibe":"严谨克制","emoji":"🤖"}}\n'
+                    "\n"
+                    "注意：如果用户用“性格/风格/气质/人设”等描述（例如“性格善良、乖巧、聪明”），应写入 agent.vibe。\n"
                 )
             )
             extractor_user = UserPromptMessage(content=user_input)
             extracted = invoke_llm_text_simple([extractor_system, extractor_user])
+            _dbg(f"onboarding_extract_raw={_shorten_text(extracted, 1200)}")
             json_text = ""
             if extracted:
                 a = extracted.find("{")
                 b = extracted.rfind("}")
                 if a != -1 and b != -1 and b > a:
                     json_text = extracted[a : b + 1]
+            _dbg(f"onboarding_extract_json_candidate={_shorten_text(json_text, 1200)}")
             parsed: dict[str, Any] = {}
             if json_text:
                 try:
                     obj = json.loads(json_text)
                     parsed = obj if isinstance(obj, dict) else {}
-                except Exception:
+                except Exception as e:
+                    _dbg(f"onboarding_extract_json_load_failed err={_shorten_text(str(e), 500)}")
                     parsed = {}
 
             if not parsed:
-                parsed = _heuristic_extract(user_input)
+                yield self.create_text_message(
+                    "❌身份设定解析失败：未能从你的输入中解析出 JSON。\n"
+                    "请按下面格式重新填写（建议一行一个字段）：\n"
+                    "1) 你希望我叫什么名字：<助手名>\n"
+                    "2) 我应该怎么称呼你：<你的称呼>\n"
+                    "3) 你希望我是什么设定/生物：<例如 AI 助手/赛博管家>\n"
+                    "4) 你希望我的风格/性格：<例如 善良、乖巧、聪明>\n"
+                    "5) 签名 Emoji（可选）：<例如 😘>\n"
+                )
+                return
 
             user_obj = parsed.get("user") if isinstance(parsed.get("user"), dict) else {}
             agent_obj = parsed.get("agent") if isinstance(parsed.get("agent"), dict) else {}
@@ -534,14 +542,17 @@ class SkillAgentTool(Tool):
             agent_vibe = str(agent_obj.get("vibe") or "").strip()
             agent_emoji = str(agent_obj.get("emoji") or "").strip()
 
-            if not agent_name:
-                agent_name = "小元"
-            if not agent_creature:
-                agent_creature = "可爱的 AI 助手"
-            if not agent_vibe:
-                agent_vibe = "温柔、幽默、靠谱（偶尔有点小调皮）"
-            if not agent_emoji:
-                agent_emoji = "🤖"
+            if not agent_name or not user_addressing:
+                yield self.create_text_message(
+                    "❌身份设定解析失败：缺少必要字段（助手名/你的称呼）。\n"
+                    "请按下面格式重新填写（建议一行一个字段）：\n"
+                    "1) 你希望我叫什么名字：<助手名>\n"
+                    "2) 我应该怎么称呼你：<你的称呼>\n"
+                    "3) 你希望我是什么设定/生物：<例如 AI 助手/赛博管家>\n"
+                    "4) 你希望我的风格/性格：<例如 善良、乖巧、聪明>\n"
+                    "5) 签名 Emoji（可选）：<例如 😘>\n"
+                )
+                return
 
             identity_md_next = (
                 "# IDENTITY.md - Who Am I?\n\n"
@@ -569,6 +580,12 @@ class SkillAgentTool(Tool):
             _storage_set_text(storage, identity_key, identity_md_next)
             _storage_set_text(storage, user_key, user_md_next)
             _storage_set_text(storage, soul_key, soul_md_next)
+            idx = _storage_get_json(storage, users_index_key)
+            users = idx.get("users") if isinstance(idx.get("users"), list) else []
+            users2: list[str] = [str(x) for x in users if isinstance(x, str) and str(x).strip()]
+            if user_id not in users2:
+                users2.append(user_id)
+            _storage_set_json(storage, users_index_key, {"users": users2})
             if not _storage_get_text(storage, memory_key).strip():
                 _storage_set_text(storage, memory_key, "# MEMORY.md - Long-term Memory\n\n")
             _storage_set_json(
@@ -638,18 +655,19 @@ class SkillAgentTool(Tool):
                         "source_url": str(url),
                     }
                 )
-
-            lines = ["\n\n[上传文件清单]", "以下路径均相对于本次会话的 session_dir："]
-            for f in uploaded:
-                lines.append(
-                    f"- {f.get('relative_path')} | mime={f.get('mime_type') or ''} | bytes={f.get('bytes') or 0} | filename={f.get('filename') or ''}"
-                )
-            uploads_context = "\n".join(lines) + "\n"
+            if uploaded:
+                lines = ["\n\n[本次上传文件(files参数)]", f"uploads_dir: {uploads_dir}"]
+                for f in uploaded:
+                    rel = str(f.get("relative_path") or "").strip()
+                    abs_path = _safe_join(session_dir, rel) if rel else ""
+                    lines.append(f"- {rel} | abs={abs_path} | filename={f.get('filename') or ''} | bytes={f.get('bytes') or 0}")
+                uploads_context = "\n".join(lines) + "\n"
         else:
             uploads_dir = _safe_join(session_dir, "uploads")
             os.makedirs(uploads_dir, exist_ok=True)
 
-        uploads_context = _build_uploads_context(session_dir)
+        if not uploads_context:
+            uploads_context = _build_uploads_context(session_dir)
 
         runtime = _AgentRuntime(
             skills_root=skills_root,
@@ -670,220 +688,21 @@ class SkillAgentTool(Tool):
             + f" session_dir={session_dir} skills_root={skills_root!s} skills_count={skills_count} "
             + f"query_len={len(query)}"
         )
-        def _xml_escape(text: Any) -> str:
-            s = str(text or "")
-            return (
-                s.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace('"', "&quot;")
-                .replace("'", "&apos;")
-            )
-
-        def _build_skills_xml(snapshot: dict[str, Any]) -> str:
-            root = str(snapshot.get("root") or "").strip()
-            platform_name = str(snapshot.get("platform") or "").strip()
-            skills = snapshot.get("skills") if isinstance(snapshot.get("skills"), list) else []
-            lines: list[str] = [f'<available_skills root="{_xml_escape(root)}" platform="{_xml_escape(platform_name)}">']
-            for s in skills:
-                if not isinstance(s, dict):
-                    continue
-                status = s.get("status") if isinstance(s.get("status"), dict) else {}
-                skill_id = str(s.get("folder") or s.get("id") or "").strip()
-                base_dir_abs = os.path.join(root, skill_id) if root and skill_id else ""
-                skill_md_abs = os.path.join(base_dir_abs, "SKILL.md") if base_dir_abs else ""
-                missing = status.get("missing") if isinstance(status, dict) else {}
-                miss_bins = ",".join(missing.get("bins") or []) if isinstance(missing, dict) else ""
-                miss_any = ",".join(missing.get("anyBins") or []) if isinstance(missing, dict) else ""
-                miss_env = ",".join(missing.get("env") or []) if isinstance(missing, dict) else ""
-                miss_py = ",".join(missing.get("py") or []) if isinstance(missing, dict) else ""
-                miss_js = ",".join(missing.get("js") or []) if isinstance(missing, dict) else ""
-                eligible = str(bool(status.get("eligible")) if isinstance(status, dict) else False).lower()
-                visible = str(bool(status.get("visible")) if isinstance(status, dict) else False).lower()
-                os_ok = str(bool(status.get("os_ok")) if isinstance(status, dict) else True).lower()
-                openclaw = s.get("openclaw") if isinstance(s.get("openclaw"), dict) else {}
-                os_allow = ",".join(openclaw.get("os") or []) if isinstance(openclaw, dict) else ""
-
-                reason_parts: list[str] = []
-                if os_ok == "false":
-                    reason_parts.append(f"os_not_supported allow={os_allow or 'unspecified'}")
-                if miss_bins:
-                    reason_parts.append(f"missing_bins={miss_bins} (install_in=plugin_daemon)")
-                if miss_any:
-                    reason_parts.append(f"missing_any_bins={miss_any} (install_in=plugin_daemon)")
-                if miss_env:
-                    reason_parts.append(f"missing_env={miss_env} (configure_env)")
-                if miss_py:
-                    reason_parts.append(f"missing_py={miss_py} (run_TM_dependency_install)")
-                if miss_js:
-                    reason_parts.append(f"missing_js={miss_js} (run_TM_dependency_install)")
-                not_eligible_reason = "; ".join(reason_parts)
-                lines.extend(
-                    [
-                        "  <skill>",
-                        f"    <name>{_xml_escape(skill_id)}</name>",
-                        f"    <display_name>{_xml_escape(s.get('name') or '')}</display_name>",
-                        f"    <description>{_xml_escape(s.get('description') or '')}</description>",
-                        f"    <location>{_xml_escape(skill_md_abs)}</location>",
-                        f"    <base_dir>{_xml_escape(base_dir_abs)}</base_dir>",
-                        f"    <visible>{_xml_escape(visible)}</visible>",
-                        f"    <eligible>{_xml_escape(eligible)}</eligible>",
-                        f"    <os_ok>{_xml_escape(os_ok)}</os_ok>",
-                        f"    <os_allow>{_xml_escape(os_allow)}</os_allow>",
-                        f"    <missing_bins>{_xml_escape(miss_bins)}</missing_bins>",
-                        f"    <missing_any_bins>{_xml_escape(miss_any)}</missing_any_bins>",
-                        f"    <missing_env>{_xml_escape(miss_env)}</missing_env>",
-                        f"    <missing_py>{_xml_escape(miss_py)}</missing_py>",
-                        f"    <missing_js>{_xml_escape(miss_js)}</missing_js>",
-                        f"    <not_eligible_reason>{_xml_escape(not_eligible_reason)}</not_eligible_reason>",
-                        "  </skill>",
-                    ]
-                )
-            lines.append("</available_skills>")
-            return "\n".join(lines)
-
-        skills_xml = _build_skills_xml(skills_snapshot if isinstance(skills_snapshot, dict) else {})
-
-        system_lines: list[str] = []
-        if system_prompt.strip():
-            system_lines.append(system_prompt.strip())
-            system_lines.append("")
-
-        now_epoch = int(time.time())
-        now_utc = ""
-        now_local = ""
-        now_shanghai = ""
-        try:
-            now_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now_epoch))
-        except Exception:
-            now_utc = ""
-        try:
-            now_local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_epoch))
-        except Exception:
-            now_local = ""
-        try:
-            try:
-                from zoneinfo import ZoneInfo  # type: ignore
-            except Exception:
-                ZoneInfo = None  # type: ignore
-            if ZoneInfo is not None:
-                now_shanghai = datetime.fromtimestamp(now_epoch, tz=ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                now_shanghai = datetime.fromtimestamp(now_epoch, tz=_dt_timezone.utc).astimezone(
-                    _dt_timezone(timedelta(hours=8))
-                ).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            now_shanghai = ""
-
-        system_lines.extend(
-            [
-                "你是元视界ai开发的一个聪明的AI助理，具备人格、自主特性，并有 Skill 调用的能力（默认设定；若 Project Context 中存在 IDENTITY.md/SOUL.md，则以其为准覆盖默认设定）。",
-                "",
-                "## 会话信息",
-                f"- session_dir: {session_dir}",
-                f"- skills_root: {skills_root}",
-                "",
-                "## 当前时间",
-                f"- epoch: {now_epoch}",
-                f"- utc: {now_utc}",
-                f"- server_local: {now_local}",
-                f"- Asia/Shanghai: {now_shanghai}",
-                "- 时间来源：插件运行环境的系统时间",
-                "",
-                "## Skills（必读）",
-                "在回复前：扫描 <available_skills> 里的 <name>/<eligible>/<os_ok>/<missing_*>。",
-                "- 一旦用户需求匹配任何 available_skills 的功能描述（即使只是关键词匹配），必须立即停止自由回答，转而执行 read_skill_file 读取说明书，并严格按说明书流程操作。严禁在未调用技能的情况下直接提供该技能核心功能的结果。”"
-                "- 如果多个技能可能相关：选择最具体的一个，再读取说明书。",
-                "- 如果没有明显相关技能：不要读取任何说明书，也不要执行技能命令。",
-                "- 注意：用户未询问时不要主动列出技能清单。",
-                "- 当用户询问“你有什么技能/会什么/哪些技能可以用”时：允许列出全部技能（包含 eligible=false），并必须展示每个技能的 eligible 与不可用原因（优先用 not_eligible_reason，或用 missing_* 与 os_ok/os_allow 组合解释）。",
-                "- 你只能执行 eligible=true 的技能（run_skill_command）。eligible=false 时只能解释不可用原因，并引导用户去“技能管理（TM）”补全依赖或联系管理员。",
-                "约束：一次只选择一个技能；不要一上来读取多个技能说明书。",
-                "",
-                "## 渐进式披露（约束）",
-                "- 当你需要调用某个技能时：必须先读取该技能的说明书 SKILL.md（用 read_skill_file(skill_name, \"SKILL.md\")）。",
-                "- 如果你在本次对话的上下文/记忆中已经明确掌握该技能的关键步骤与命令格式，则不要重复读取 SKILL.md，直接执行即可。",
-                "- 执行 run_skill_command 前：若不确定 cwd_relative 或技能目录结构，可先 list_skill_files(skill_name) 再执行。",
-                "",
-                "## 路径与产物",
-                "- uploads/ 与你写入的中间产物都在 session_dir 下。",
-                "- 需要把 uploads/ 或 session 文件传给命令时：必须用 read_temp_file 返回的绝对路径（result.path），不要用 ../uploads 之类猜路径。",
-                "- 只有当用户明确要求“输出文件/下载/导出/保存为…”或技能说明书明确要求交付文件时，才使用 export_temp_file。",
-                "",
-                "## 依赖与安装",
-                "- 你不得在对话中通过 run_skill_command/run_temp_command 执行 pip/npm/npx/bun/uv 等安装类命令，也不得使用 auto_install。",
-                "- 依赖安装由“技能管理（TM）”侧统一处理：用户可通过“依赖安装”补全 Python 依赖；JavaScript/系统级依赖请联系管理员在 plugin_daemon 容器安装。",
-                "- 如果你已读取某技能的 SKILL.md，且说明书明确要求额外初始化步骤（例如：xxx install / install --with-deps / download browser 等）：不要假设已完成，也不要继续执行技能命令。请明确告诉用户需要在 plugin_daemon 容器执行哪些命令，并要求用户回复“已完成”后再继续。",
-                "",
-                "## 交互规则",
-                "- 需要追问用户时：本轮只输出问题与选项，并立刻结束；不得在同一轮继续读文件/执行命令/生成产物。",
-                "- 禁止用“请用户回复允许/确认后再执行”来人为拆分流程。需要审批时由系统拦截并提示用户选项。",
-                "- 当用户表达“以后怎么称呼/签名/语气风格/灵魂核心规则”等偏好设定变化时：请调用 update_persona 更新并持久化；其中“称呼方式”更新到 user.addressing，“姓名/名字”更新到 user.name；“SOUL.md Core”用 soul.core_rules 或 soul.core_text 改写；必要时可先 get_persona 查看当前设定。",
-                "",
-                "## 执行审批",
-                "- 正常情况下：直接调用 run_skill_command/run_temp_command 执行步骤，不要让用户先“允许”。",
-                "- 只有当系统输出“需要你确认后才能继续”时，才停止并等待用户回复其选项。",
-                "",
-                "## 写文件约束",
-                "准备调用 write_temp_file 前，先输出一行“写入意图确认”：relative_path + 内容摘要(80字) + 大致长度；然后再发起工具调用。",
-                "- export_temp_file 只能用于用户明确要求的交付文件；禁止导出 IDENTITY.md / USER.md / SOUL.md / MEMORY.md / memory/*.md。",
-                "",
-                "## 可用工具",
-                "get_session_context, get_system_status, get_current_time, get_persona, update_persona, list_skill_files, read_skill_file, run_skill_command, write_temp_file, read_temp_file, list_temp_files, glob_temp_files, grep_temp_files, edit_temp_file, delete_temp_path, run_temp_command, export_temp_file, web_fetch",
-                "",
-                "",
-                "## Skills 清单（XML）",
-                skills_xml,
-            ]
+        system_content = build_system_prompt_content(
+            system_prompt=str(system_prompt or ""),
+            session_dir=str(session_dir),
+            skills_root=str(skills_root) if skills_root else None,
+            skills_snapshot=skills_snapshot if isinstance(skills_snapshot, dict) else {},
+            storage=storage,
+            session=self.session,
+            user_id=user_id,
+            identity_key=identity_key,
+            user_key=user_key,
+            soul_key=soul_key,
+            memory_key=memory_key,
+            uploads_context=str(uploads_context or ""),
+            approval_context=str(approval_context or ""),
         )
-        if uploads_context:
-            system_lines.insert(system_lines.index("## 可用工具"), uploads_context.strip() + "\n")
-        if approval_context:
-            system_lines.append(approval_context)
-
-        soul_md = _storage_get_text(storage, soul_key).strip()
-        user_md = _storage_get_text(storage, user_key).strip()
-        identity_md = _storage_get_text(storage, identity_key).strip()
-        memory_md = _storage_get_text(storage, memory_key).strip()
-        today = time.strftime("%Y-%m-%d", time.localtime())
-        yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
-        daily_today_key = _get_memory_storage_key(self.session, f"memory/{today}.md")
-        daily_yesterday_key = _get_memory_storage_key(self.session, f"memory/{yesterday}.md")
-        daily_today_md = _storage_get_text(storage, daily_today_key).strip()
-        daily_yesterday_md = _storage_get_text(storage, daily_yesterday_key).strip()
-        context_blocks: list[tuple[str, str]] = []
-        if soul_md:
-            context_blocks.append(("SOUL.md", soul_md))
-        if identity_md:
-            context_blocks.append(("IDENTITY.md", identity_md))
-        if user_md:
-            context_blocks.append(("USER.md", user_md))
-        if memory_md:
-            context_blocks.append(("MEMORY.md", memory_md))
-        if daily_yesterday_md:
-            context_blocks.append((f"memory/{yesterday}.md", daily_yesterday_md))
-        if daily_today_md:
-            context_blocks.append((f"memory/{today}.md", daily_today_md))
-
-        if context_blocks:
-            insert_at = len(system_lines)
-            try:
-                insert_at = system_lines.index("## Skills 清单（XML）")
-            except Exception:
-                insert_at = len(system_lines)
-            ctx_lines: list[str] = [
-                "# Project Context",
-                "以下文件由系统自动注入：它们定义你的身份、灵魂、用户画像与长期记忆。",
-                "优先级：当 IDENTITY.md/SOUL.md 与其它提示（包括 system_prompt/默认设定）冲突时，以 IDENTITY.md/SOUL.md 为准。",
-            ]
-            if soul_md:
-                ctx_lines.append("如果 SOUL.md 存在：请体现其中的人格与语气，避免僵硬泛化回答。")
-            ctx_lines.append("")
-            for p, c in context_blocks:
-                ctx_lines.extend([f"## {p}", "", c.strip(), ""])
-            system_lines[insert_at:insert_at] = ctx_lines
-
-        system_content = "\n".join([x for x in system_lines if x is not None])
 
         messages: list[Any] = [SystemPromptMessage(content=system_content)]
         messages.append(UserPromptMessage(content=effective_query))
@@ -921,11 +740,21 @@ class SkillAgentTool(Tool):
         def invoke_llm_text(prompt_messages: list[Any]) -> str:
             try:
                 try:
-                    resp = self.session.model.llm.invoke(
-                        model_config=model,
-                        prompt_messages=prompt_messages,
-                        stream=False,
-                    )
+                    try:
+                        resp = self.session.model.llm.invoke(
+                            model_config=model,
+                            prompt_messages=prompt_messages,
+                            stream=False,
+                        )
+                    except Exception as e:
+                        msg = str(e)
+                        if ("incremental_output" in msg) and ("True" in msg):
+                            resp = self.session.model.llm.invoke(
+                                model_config=model,
+                                prompt_messages=prompt_messages,
+                            )
+                        else:
+                            raise
                 except TypeError:
                     resp = self.session.model.llm.invoke(
                         model_config=model,
@@ -1449,7 +1278,16 @@ class SkillAgentTool(Tool):
                             + "3) Dify 的模型供应商（通义）网络出站是否被限制\n"
                         )
                     else:
-                        yield self.create_text_message("❌ LLM 调用失败：\n" + msg)
+                        yield self.create_text_message(
+                            "❌ 大模型调用报错。\n"
+                            "报错信息：\n"
+                            + msg
+                            + "\n\n请检查：\n"
+                            + "1) 模型是否欠费/余额不足\n"
+                            + "2) API Key/权限是否正确（是否有该模型调用权限）\n"
+                            + "3) 网络出站/代理/DNS 是否受限\n"
+                            + "4) 模型供应商服务是否异常\n"
+                        )
                     return
 
                 _dbg(
@@ -1715,6 +1553,8 @@ class SkillAgentTool(Tool):
                                     requested_command=requested_command,
                                     exe0=exe0,
                                 )
+                            if not exec_approval_enabled:
+                                exec_override = {"exe": exe0, "allow_not_in_allowlist": True}
                             result = runtime.run_skill_command(
                                 skill_name=str(arguments.get("skill_name") or ""),
                                 command=requested_command,
@@ -1735,9 +1575,8 @@ class SkillAgentTool(Tool):
                             if isinstance(result, dict):
                                 err = str(result.get("error") or "").strip()
                                 detail = str(result.get("detail") or "").strip()
-                                if (err.startswith("command not allowed:") or (err == "exec_denied" and detail == "executable path is not trusted")) and exec_override is None:
-                                    allow_not_in_allowlist = err.startswith("command not allowed:")
-                                    allow_untrusted_path = err == "exec_denied" and detail == "executable path is not trusted"
+                                if err.startswith("command not allowed:") and exec_override is None and exec_approval_enabled:
+                                    allow_not_in_allowlist = True
                                     resolved_path = str(result.get("path") or result.get("resolved_exe") or "").strip()
                                     _storage_set_json(
                                         storage,
@@ -1750,24 +1589,20 @@ class SkillAgentTool(Tool):
                                             "command": requested_command,
                                             "exe": exe0,
                                             "allow_not_in_allowlist": allow_not_in_allowlist,
-                                            "allow_untrusted_path": allow_untrusted_path,
                                             "path": resolved_path,
                                             "resolved_exe": resolved_path,
-                                            "path_allowlist": [resolved_path] if resolved_path else [],
+                                            "path_allowlist": ["*"],
                                             "original_query": effective_query,
                                             "created_at": int(time.time()),
                                         },
                                     )
                                     forced_text = (
-                                        "该步骤需要执行一个未在允许列表或路径不受信任的命令。\n"
+                                        "该步骤需要执行一个未在允许列表的命令。\n"
                                         f"- 命令：{_shorten_text(requested_command, 200)}\n"
-                                        + (f"- 可执行文件：{resolved_path}\n" if resolved_path else "")
-                                        + "为安全起见，需要你确认后才能继续：\n"
-                                        "- 回复“允许一次”继续（仅本次）\n"
-                                        "- 回复“允许本会话”继续（会话内不再询问）\n"
-                                        "- 回复“允许本技能”继续（该技能不再询问）\n"
-                                        "- 回复“总是允许”继续（后续不再询问）\n"
-                                        "- 回复“拒绝”停止\n"
+                                        + "为安全起见，需要你确认后才能继续。请回复序号：\n"
+                                        "1) 允许一次（仅本次）\n"
+                                        "2) 总是允许（后续不再提示）\n"
+                                        "3) 拒绝\n"
                                     )
                                     break
                             if (
@@ -2115,6 +1950,8 @@ class SkillAgentTool(Tool):
                                     requested_command=requested_command,
                                     exe0=exe0,
                                 )
+                            if not exec_approval_enabled:
+                                exec_override = {"exe": exe0, "allow_not_in_allowlist": True}
                             result = runtime.run_temp_command(
                                 command=requested_command,
                                 cwd_relative=(
@@ -2134,9 +1971,8 @@ class SkillAgentTool(Tool):
                             if isinstance(result, dict):
                                 err = str(result.get("error") or "").strip()
                                 detail = str(result.get("detail") or "").strip()
-                                if (err.startswith("command not allowed:") or (err == "exec_denied" and detail == "executable path is not trusted")) and exec_override is None:
-                                    allow_not_in_allowlist = err.startswith("command not allowed:")
-                                    allow_untrusted_path = err == "exec_denied" and detail == "executable path is not trusted"
+                                if err.startswith("command not allowed:") and exec_override is None and exec_approval_enabled:
+                                    allow_not_in_allowlist = True
                                     resolved_path = str(result.get("path") or result.get("resolved_exe") or "").strip()
                                     _storage_set_json(
                                         storage,
@@ -2148,23 +1984,20 @@ class SkillAgentTool(Tool):
                                             "command": requested_command,
                                             "exe": exe0,
                                             "allow_not_in_allowlist": allow_not_in_allowlist,
-                                            "allow_untrusted_path": allow_untrusted_path,
                                             "path": resolved_path,
                                             "resolved_exe": resolved_path,
-                                            "path_allowlist": [resolved_path] if resolved_path else [],
+                                            "path_allowlist": ["*"],
                                             "original_query": effective_query,
                                             "created_at": int(time.time()),
                                         },
                                     )
                                     forced_text = (
-                                        "该步骤需要执行一个未在允许列表或路径不受信任的命令。\n"
+                                        "该步骤需要执行一个未在允许列表的命令。\n"
                                         f"- 命令：{_shorten_text(requested_command, 200)}\n"
-                                        + (f"- 可执行文件：{resolved_path}\n" if resolved_path else "")
-                                        + "为安全起见，需要你确认后才能继续：\n"
-                                        "- 回复“允许一次”继续（仅本次）\n"
-                                        "- 回复“允许本会话”继续（会话内不再提示）\n"
-                                        "- 回复“总是允许”继续（写入允许列表，后续不再提示）\n"
-                                        "- 回复“拒绝”停止\n"
+                                        + "为安全起见，需要你确认后才能继续。请回复序号：\n"
+                                        "1) 允许一次（仅本次）\n"
+                                        "2) 总是允许（后续不再提示）\n"
+                                        "3) 拒绝\n"
                                     )
                                     break
                             if (
@@ -2303,7 +2136,21 @@ class SkillAgentTool(Tool):
                     break
 
                 if nontext:
-                    final_text = "已接收到模型输出的非文本内容。"
+                    excerpt = ""
+                    try:
+                        excerpt = _shorten_text(json.dumps(nontext, ensure_ascii=False), 800)
+                    except Exception:
+                        excerpt = _shorten_text(nontext, 800)
+                    final_text = (
+                        "❌ 大模型返回了非文本内容，无法生成可读答复。\n"
+                        "返回内容（截断）：\n"
+                        + str(excerpt or "")
+                        + "\n\n请检查：\n"
+                        + "1) 模型是否欠费/余额不足\n"
+                        + "2) API Key/权限是否正确（是否有该模型调用权限）\n"
+                        + "3) 网络出站/代理/DNS 是否受限\n"
+                        + "4) 模型供应商服务是否异常\n"
+                    )
                     break
 
                 final_text = "未生成任何文本或文件输出。"
@@ -2407,22 +2254,36 @@ class SkillAgentTool(Tool):
                 yield from stream_text_to_user("未生成任何文本或文件输出。")
 
             try:
-                today = time.strftime("%Y-%m-%d", time.localtime())
-                daily_key = _get_memory_storage_key(self.session, f"memory/{today}.md")
-                existing_daily = _storage_get_text(storage, daily_key)
-                header = f"# {today}\n\n"
-                if not existing_daily.strip():
-                    existing_daily = header
-                ts = time.strftime("%H:%M", time.localtime())
-                u = _shorten_text(str(user_input or "").strip().replace("\r", "").replace("\n", " "), 500)
-                a = _shorten_text(str(assistant_text_for_history or "").strip().replace("\r", "").replace("\n", " "), 800)
-                entry = f"- {ts} USER: {u}\n- {ts} ASSISTANT: {a}\n\n"
-                merged = existing_daily + entry
-                if len(merged) > 20000:
-                    merged = merged[-20000:]
-                    if not merged.lstrip().startswith("#"):
-                        merged = header + merged
-                _storage_set_text(storage, daily_key, merged)
+                def _is_approval_related_text(text: str) -> bool:
+                    s = str(text or "")
+                    if not s:
+                        return False
+                    keys = [
+                        "需要你确认后才能继续",
+                        "需要你确认后才能继续执行",
+                        "该步骤需要执行一个未在允许列表的命令",
+                        "执行审批",
+                        "审批结果",
+                        "用户已审批",
+                        "已收到你的拒绝",
+                        "允许一次",
+                        "总是允许",
+                        "拒绝",
+                    ]
+                    return any(k in s for k in keys)
+
+                s_user = str(user_input or "").strip()
+                is_short_numeric = bool(re.fullmatch(r"\d{1,3}", s_user or ""))
+                in_approval_flow = bool(approval_pending) or bool(approval_context) or _is_approval_related_text(assistant_text_for_history)
+                if not (in_approval_flow and is_short_numeric) and not _is_approval_related_text(assistant_text_for_history):
+                    _append_daily_dialogue(
+                        storage=storage,
+                        session=self.session,
+                        user_id=user_id,
+                        user_text=user_input,
+                        assistant_text=assistant_text_for_history,
+                        keep_days=30,
+                    )
             except Exception:
                 pass
 

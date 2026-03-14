@@ -8,11 +8,11 @@ identity:
     ja_JP: "Mini_Claw"
 description:
   human:
-    en_US: "A smart, soulful, and more secure version of the mini claw, a growing 'personal/enterprise' assistant that gets smarter with each interaction."
-    zh_Hans: "聪明、有灵魂，更安全的 Dify 版小龙虾，一个越来越懂你的'个人/企业'贴心助手。"
-    pt_BR: "SUm mini lagostim com alma, uma versão mais inteligente, mais segura e mais personalizada do mini lagostim."
-    ja_JP: "魂のあるミニザリガニ、より賢く、より安全に、よりユーザーに合わせたバージョンのミニザリガニ。"
-  llm: "A smart, soulful, and more secure version of the mini claw, a growing 'personal/enterprise' assistant that gets smarter with each interaction."
+    en_US: "A smart, soulful, and more secure version of the mini claw, a growing 'personal/enterprise' assistant that gets smarter with each interaction.【Capable of skill invocation】"
+    zh_Hans: "聪明、有灵魂，更安全的 Dify 版小龙虾，一个越来越懂你的'个人/企业'贴心助手。【具备skill调用能力】"
+    pt_BR: "SUm mini lagostim com alma, uma versão mais inteligente, mais segura e mais personalizada do mini lagostim.【Capacidade de invocação de habilidades】"
+    ja_JP: "魂のあるミニザリガニ、より賢く、より安全に、よりユーザーに合わせたバージョンのミニザリガニ。【能力：スキルの呼び出し】"
+  llm: "A smart, soulful, and more secure version of the mini claw, a growing 'personal/enterprise' assistant that gets smarter with each interaction.【Capable of skill invocation】"
 parameters:
   - name: query
     type: string
@@ -112,6 +112,23 @@ parameters:
       pt_BR: Detect repetitive tool-call loops and stop early.
       ja_JP: ツール呼び出しの反復ループを検出して早期停止する
     llm_description: Detect repetitive tool-call loops and stop early.
+    form: form
+
+  - name: exec_approval_enabled
+    type: boolean
+    required: true
+    default: true
+    label:
+      en_US: Execution approval
+      zh_Hans: 执行审批开关
+      pt_BR: Execution approval
+      ja_JP: 実行承認
+    human_description:
+      en_US: When disabled, commands run without interactive approval prompts.
+      zh_Hans: 关闭后，命令执行不再弹出“允许/拒绝”确认，直接放行。
+      pt_BR: When disabled, commands run without interactive approval prompts.
+      ja_JP: 無効にすると、コマンド実行で承認確認を求めません。
+    llm_description: Toggle whether command execution requires interactive approval.
     form: form
 extra:
   python:

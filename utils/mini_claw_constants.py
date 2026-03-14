@@ -14,7 +14,6 @@ EXEC_ALLOWED_BINS = {
     "npm",
     "npx",
     "bun",
-    "curl",
     "uvx",
     "wget",
     "git",

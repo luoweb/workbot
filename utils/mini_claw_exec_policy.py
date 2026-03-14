@@ -137,20 +137,15 @@ def resolve_and_validate_exec(
     resolved_exe_path: str | None = None
     override_exe = str((exec_override or {}).get("exe") or "").strip()
     allow_not_in_allowlist = bool((exec_override or {}).get("allow_not_in_allowlist") is True)
-    allow_untrusted_path = bool((exec_override or {}).get("allow_untrusted_path") is True)
-    allow_path_patterns = (exec_override or {}).get("path_allowlist") if isinstance(exec_override, dict) else None
-    if not isinstance(allow_path_patterns, list):
-        allow_path_patterns = []
-    allow_path_patterns = [str(x) for x in allow_path_patterns if str(x or "").strip()]
 
     if exe == "python":
         resolved_exe_path = os.path.abspath(sys.executable)
         argv = [resolved_exe_path] + argv[1:]
     else:
+        resolved_exe_path = _resolve_executable(exe)
+        resolved_norm_for_err = os.path.abspath(str(resolved_exe_path)) if resolved_exe_path else None
         if exe not in allow_bins:
-            resolved_exe_path = _resolve_executable(exe)
-            resolved_norm_for_err = os.path.abspath(str(resolved_exe_path)) if resolved_exe_path else None
-            if not (allow_not_in_allowlist and override_exe and exe == override_exe and resolved_exe_path and _match_any_path_pattern(resolved_exe_path, allow_path_patterns)):
+            if not (allow_not_in_allowlist and override_exe and exe == override_exe):
                 hint = ""
                 if exe in {"top", "df", "free", "ps", "uptime", "vmstat", "iostat"}:
                     hint = "该类系统命令默认被禁用；请改用 get_system_status 获取安全版的负载/内存/磁盘信息。"
@@ -159,24 +154,14 @@ def resolve_and_validate_exec(
                     out["path"] = resolved_norm_for_err
                     out["resolved_exe"] = resolved_norm_for_err
                 return out
-            if not resolved_exe_path:
-                return {
-                    "ok": False,
-                    "error": "executable_not_found",
-                    "exe": exe,
-                    "hint": _missing_executable_hint(exe),
-                }
-            argv = [resolved_exe_path] + argv[1:]
-        else:
-            resolved_exe_path = _resolve_executable(exe)
-            if not resolved_exe_path:
-                return {
-                    "ok": False,
-                    "error": "executable_not_found",
-                    "exe": exe,
-                    "hint": _missing_executable_hint(exe),
-                }
-            argv = [resolved_exe_path] + argv[1:]
+        if not resolved_exe_path:
+            return {
+                "ok": False,
+                "error": "executable_not_found",
+                "exe": exe,
+                "hint": _missing_executable_hint(exe),
+            }
+        argv = [resolved_exe_path] + argv[1:]
 
     exe_name = os.path.basename(str(resolved_exe_path or "")).lower()
     deny_reason = _deny_by_args(exe_name, argv[1:])
@@ -188,20 +173,5 @@ def resolve_and_validate_exec(
         return {"ok": False, "error": "exec_denied", "detail": "executable inside session_dir is not allowed"}
     if skills_root and _is_under_dir(resolved_norm, skills_root):
         return {"ok": False, "error": "exec_denied", "detail": "executable inside skills_root is not allowed"}
-    if not _is_trusted_exec_path(resolved_norm, trusted_dir_prefixes):
-        if not (
-            allow_untrusted_path
-            and override_exe
-            and exe == override_exe
-            and allow_path_patterns
-            and _match_any_path_pattern(resolved_norm, allow_path_patterns)
-        ):
-            return {
-                "ok": False,
-                "error": "exec_denied",
-                "detail": "executable path is not trusted",
-                "exe": exe,
-                "path": resolved_norm,
-            }
 
     return {"ok": True, "argv": argv, "resolved_exe": resolved_norm, "exe": exe}

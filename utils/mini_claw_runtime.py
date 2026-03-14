@@ -814,6 +814,8 @@ class _AgentRuntime:
             tz_norm = "Asia/Shanghai"
         if tz_norm.upper() in {"UTC", "GMT"}:
             tz_norm = "UTC"
+        if not tz_norm:
+            tz_norm = "Asia/Shanghai"
 
         tz_time = ""
         tz_offset_minutes: int | None = None
@@ -929,6 +931,47 @@ class _AgentRuntime:
         if not os.path.isdir(cwd):
             return {"error": "cwd_not_found", "cwd": cwd, "cwd_relative": cwd_relative}
         try:
+            started_at = time.time()
+            excluded_dir_names = {
+                "node_modules",
+                ".venv",
+                "__pycache__",
+                ".git",
+                ".idea",
+                ".vscode",
+                "dist",
+                "build",
+                "out",
+                ".pytest_cache",
+                ".mypy_cache",
+            }
+
+            def list_skill_files_snapshot() -> set[str]:
+                out: set[str] = set()
+                try:
+                    for root_dir, dirs, files in os.walk(skill_path):
+                        dirs[:] = [d for d in dirs if d not in excluded_dir_names]
+                        for fn in files:
+                            full = os.path.join(root_dir, fn)
+                            try:
+                                if os.path.islink(full) or (not os.path.isfile(full)):
+                                    continue
+                            except Exception:
+                                continue
+                            try:
+                                rel = os.path.relpath(full, skill_path).replace("\\", "/")
+                            except Exception:
+                                continue
+                            rp = _normalize_relative_file_path(rel)
+                            if not rp:
+                                continue
+                            out.add(rp)
+                except Exception:
+                    return out
+                return out
+
+            before_files = list_skill_files_snapshot()
+
             env = os.environ.copy()
             env["SKILL_AGENT_SESSION_DIR"] = self.session_dir
             env["SKILL_AGENT_UPLOADS_DIR"] = os.path.join(self.session_dir, "uploads")
@@ -949,7 +992,84 @@ class _AgentRuntime:
                 errors="ignore",
                 env=env,
             )
-            return {"returncode": result.returncode, "stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
+            after_files = list_skill_files_snapshot()
+            new_files = [p for p in after_files if p not in before_files]
+            moved: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            if new_files:
+                os.makedirs(self.session_dir, exist_ok=True)
+                dest_base = _safe_join(self.session_dir, f"skill_outputs/{resolved}")
+                os.makedirs(dest_base, exist_ok=True)
+
+                max_files = 50
+                max_total_bytes = 50 * 1024 * 1024
+                total_bytes = 0
+                for rp in sorted(new_files):
+                    if len(moved) >= max_files:
+                        skipped.append({"relative_path": rp, "reason": "too_many_files"})
+                        continue
+                    if rp.lower() in {"skill.md", "_meta.json"}:
+                        skipped.append({"relative_path": rp, "reason": "reserved_file"})
+                        continue
+                    try:
+                        src = _safe_join(skill_path, rp)
+                    except Exception:
+                        skipped.append({"relative_path": rp, "reason": "invalid_path"})
+                        continue
+                    try:
+                        if os.path.islink(src) or (not os.path.isfile(src)):
+                            skipped.append({"relative_path": rp, "reason": "not_a_regular_file"})
+                            continue
+                        size = int(os.path.getsize(src))
+                    except Exception:
+                        skipped.append({"relative_path": rp, "reason": "stat_failed"})
+                        continue
+                    if size <= 0:
+                        skipped.append({"relative_path": rp, "reason": "empty_file"})
+                        continue
+                    if total_bytes + size > max_total_bytes:
+                        skipped.append({"relative_path": rp, "reason": "total_size_limit"})
+                        continue
+
+                    try:
+                        dest = _safe_join(dest_base, rp)
+                        os.makedirs(os.path.dirname(dest), exist_ok=True)
+                        if os.path.exists(dest):
+                            stem, ext = os.path.splitext(dest)
+                            dest = f"{stem}_{int(time.time())}{ext}"
+                        shutil.move(src, dest)
+                        total_bytes += size
+                        moved.append(
+                            {
+                                "skill_relative_path": rp,
+                                "session_relative_path": f"skill_outputs/{resolved}/{rp}".replace("\\", "/"),
+                                "bytes": size,
+                            }
+                        )
+                        try:
+                            cur = os.path.dirname(src)
+                            while cur and os.path.abspath(cur) != os.path.abspath(skill_path):
+                                if os.listdir(cur):
+                                    break
+                                os.rmdir(cur)
+                                cur = os.path.dirname(cur)
+                        except Exception:
+                            pass
+                    except Exception:
+                        skipped.append({"relative_path": rp, "reason": "move_failed"})
+                        continue
+
+            return {
+                "returncode": result.returncode,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip(),
+                "artifacts": {
+                    "moved": moved,
+                    "skipped": skipped,
+                    "dest_base": f"skill_outputs/{resolved}".replace("\\", "/") if moved else "",
+                    "started_at": started_at,
+                },
+            }
         except FileNotFoundError as e:
             return {"error": "executable_not_found", "exe": str(command[0] or exe), "exception": str(e)}
         except Exception as e:

@@ -35,10 +35,20 @@ def _build_uploads_context(session_dir: str, *, max_files: int = 50) -> str:
         files.append({"relative_path": f"uploads/{rel}", "bytes": size, "mime_type": mime, "filename": filename})
     if not files:
         return ""
+    files = sorted(files, key=lambda x: str(x.get("relative_path") or ""))
     files = files[: max(1, int(max_files or 50))]
-    lines = ["\n\n[上传文件清单]", "以下路径均相对于本次会话的 session_dir："]
+    lines = [
+        "\n\n[上传文件]",
+        f"用户本次通过 files 参数上传的文件会保存到：{uploads_dir}",
+        "请使用 read_temp_file(relative_path) 读取文件；需要把文件传给命令时，用 read_temp_file 返回的绝对路径（result.path）。",
+        "",
+        "[上传文件清单]",
+        "以下路径均相对于本次会话的 session_dir：",
+    ]
     for f in files:
+        rel = str(f.get("relative_path") or "")
+        abs_path = _safe_join(session_dir, rel) if rel else ""
         lines.append(
-            f"- {f.get('relative_path')} | mime={f.get('mime_type') or ''} | bytes={f.get('bytes') or 0} | filename={f.get('filename') or ''}"
+            f"- {rel} | abs={abs_path} | mime={f.get('mime_type') or ''} | bytes={f.get('bytes') or 0} | filename={f.get('filename') or ''}"
         )
     return "\n".join(lines) + "\n"
