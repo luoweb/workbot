@@ -63,7 +63,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: work-bot.difypkg
-          path: dify-plugins/**
+          path: **/*.difypkg
           if-no-files-found: error
 
       # - name: Checkout target repo
